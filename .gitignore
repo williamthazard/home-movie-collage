@@ -1,0 +1,5 @@
+# rendered collages, their plans, and the ffprobe cache
+*.mp4
+*.plan.json
+.probe-cache.json
+.*.part.*
