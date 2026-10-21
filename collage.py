@@ -2,10 +2,11 @@
 """Build a random, heavily-zoomed, silent video collage from a folder (or folders) of videos.
 
 Pipeline:
-  1. discover video files under the given paths (skipping iCloud placeholders),
+  1. discover video files under the given paths (skipping iCloud placeholders and earlier collages),
   2. ffprobe each one (cached in .probe-cache.json next to this script),
-  3. plan random clips: source, start, length, speed, rotation, fixed zoom window, transition,
-  4. render every clip to a normalized intermediate in parallel,
+  3. plan random clips in whole frames: source, start, length, speed, rotation, fixed zoom window,
+     transition,
+  4. render every clip to a normalized intermediate in parallel, dropping any that fail,
   5. join intermediates with hard cuts or crossfades into the final file.
 
 The plan is written next to the output as <output>.plan.json so you can trace any shot back
@@ -30,10 +31,11 @@ CACHE_PATH = Path(__file__).with_name(".probe-cache.json")
 
 
 def discover(paths):
-    """Return (video files, number of iCloud placeholders skipped). Unreadable directories are
-    reported rather than silently skipped: on macOS that usually means the terminal/Python
-    needs Files & Folders or Full Disk Access permission."""
-    files, dataless = [], 0
+    """Return (video files, iCloud placeholders skipped, earlier collages skipped). A video with a
+    .plan.json beside it is this script's own output, so it is not fed back in as a source.
+    Unreadable directories are reported rather than silently skipped: on macOS that usually
+    means the terminal/Python needs Files & Folders or Full Disk Access permission."""
+    files, dataless, collages = [], 0, 0
 
     def unreadable(err):
         print(f"warning: cannot read {err.filename}: {err.strerror}", file=sys.stderr)
@@ -52,8 +54,11 @@ def discover(paths):
             if getattr(p.stat(), "st_flags", 0) & SF_DATALESS:
                 dataless += 1
                 continue
+            if p.with_name(p.name + ".plan.json").exists():
+                collages += 1
+                continue
             files.append(p.resolve())
-    return sorted(set(files)), dataless
+    return sorted(set(files)), dataless, collages
 
 
 def probe(path):
@@ -101,6 +106,13 @@ def probe_all(files, jobs):
     return {f: cache[keyed[f]] for f in files if cache.get(keyed[f])}
 
 
+def fit_fade(frames, clip_frames, prev_frames):
+    """Cap a crossfade at 45% of both clips it overlaps. xfade silently drops the outgoing side
+    when its offset passes that side's last frame, so a fade under 2 frames becomes a hard cut."""
+    frames = int(min(frames, 0.45 * min(clip_frames, prev_frames)))
+    return frames if frames >= 2 else 0
+
+
 def plan_clips(sources, args, rng):
     out_w, out_h = args.size
     aspect = out_w / out_h
@@ -108,16 +120,20 @@ def plan_clips(sources, args, rng):
     if not usable:
         sys.exit("no usable sources (all shorter than --min-source)")
 
-    clips, timeline = [], 0.0
-    while timeline < args.duration:
+    # Lengths and fades are whole frames at --fps, so the xfade offsets computed in assemble()
+    # land exactly on frames instead of drifting off the end of a group.
+    fps, clips, timeline = args.fps, [], 0
+    while timeline < args.duration * fps:
         path, meta = rng.choice(usable)
         speed = 1.0
         if rng.random() < args.speed_prob:
             speed = math.exp(rng.uniform(math.log(args.speed_min), math.log(args.speed_max)))
         # `span` is the stretch of source consumed; the clip plays it back in span / speed seconds.
         span = min(rng.uniform(args.clip_min, args.clip_max) * speed, meta["duration"] - 0.05)
-        length = span / speed
-        start = rng.uniform(0, meta["duration"] - span)
+        frames = max(1, int(span / speed * fps))
+        length = frames / fps
+        span = length * speed
+        start = rng.uniform(0, max(0.0, meta["duration"] - span))
 
         angle = 0.0
         if rng.random() < args.rotate_prob:
@@ -138,36 +154,37 @@ def plan_clips(sources, args, rng):
         bx = rng.randint(0, sw - bw)
         by = rng.randint(0, sh - bh)
 
-        fade = 0.0
+        fade = 0
         if clips and rng.random() < args.fade_prob:
-            cap = 0.45 * min(length, clips[-1]["length"])
-            fade = min(rng.uniform(args.fade_min, args.fade_max), cap)
+            fade = fit_fade(rng.uniform(args.fade_min, args.fade_max) * fps, frames, clips[-1]["frames"])
         clips.append({
             "source": str(path),
             "start": round(start, 3),
-            "length": round(length, 3),
+            "length": round(length, 4),
+            "frames": frames,
             "speed": round(speed, 3),
             "zoom": round(min(sw, sh * aspect) / cw, 3),
             "rotation": round(angle, 2),
             "window": [cw, ch],
             "box": [bw, bh, bx, by],
-            "fade_in": round(fade, 3),
+            "fade_in": round(fade / fps, 4),
+            "fade_frames": fade,
             "sar": meta["sar"],
             "source_size": [sw, sh],
         })
-        timeline += length - fade
+        timeline += frames - fade
     return clips
 
 
-def clip_filter(clip, args):
-    """Video filter chain: retime, crop the window's bounding box, rotate so the window is
-    upright and cut out, then scale it up to the output size."""
+def clip_filter(clip, args, trim=0.0):
+    """Video filter chain: drop `trim` seconds decoded before the clip's start, retime, crop the
+    window's bounding box, rotate so the window is upright and cut out, then scale it up to the
+    output size. Timestamps are always rebased: a seek can deliver a first frame after 0."""
     out_w, out_h = args.size
     cw, ch = clip["window"]
     bw, bh, bx, by = clip["box"]
-    chain = []
-    if clip["speed"] != 1.0:
-        chain.append(f"setpts=(PTS-STARTPTS)/{clip['speed']}")
+    chain = [f"trim=start={trim:.3f}"] if trim else []
+    chain.append(f"setpts=(PTS-STARTPTS)/{clip['speed']}")
     if abs(clip["sar"] - 1.0) > 1e-3:
         chain.append(f"scale={clip['source_size'][0]}:ih,setsar=1")
     chain.append(f"crop={bw}:{bh}:{bx}:{by}")
@@ -183,48 +200,73 @@ def clip_filter(clip, args):
     return ",".join(chain)
 
 
+def count_frames(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+         "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True,
+    )
+    return int(out.stdout) if out.stdout.strip().isdigit() else 0
+
+
 def render_clip(index, clip, args, workdir):
+    """A fast seek into an MPEG-TS (which has no index) lands after the keyframe it needed, so
+    decoding starts at the next one: a clip from camcorder footage begins a few frames late, and
+    one near the end of a file can come out empty while ffmpeg still exits 0. Every attempt is
+    checked by counting frames; retries seek further back, then from the top, and trim up to
+    the planned start."""
     out = workdir / f"clip{index:05d}.mkv"
-    cmd = ["ffmpeg", "-v", "error", "-y", "-ss", str(clip["start"]), "-i", clip["source"],
-           "-vf", clip_filter(clip, args), "-an", "-t", str(clip["length"]),
-           "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", str(out)]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        raise RuntimeError(f"clip {index} from {clip['source']} failed:\n{res.stderr}")
-    return out
+    start = clip["start"]
+    for seek in sorted({start, max(0.0, start - 10), 0.0}, reverse=True):
+        cmd = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-ss", f"{seek:.3f}", "-i", clip["source"],
+               "-vf", clip_filter(clip, args, trim=start - seek), "-an", "-frames:v", str(clip["frames"]),
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", str(out)]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError((res.stderr.strip().splitlines() or ["ffmpeg failed"])[-1])
+        if count_frames(out) == clip["frames"]:
+            return out
+    raise RuntimeError(f"no frames decoded at {start}s")
 
 
 def assemble(clip_files, clips, args):
     """Hard cuts are concatenated into groups; groups are joined with xfade."""
     groups = []
     for i, clip in enumerate(clips):
-        if i == 0 or clip["fade_in"] > 0:
-            groups.append({"members": [], "fade_in": clip["fade_in"], "length": 0.0})
+        if i == 0 or clip["fade_frames"] > 0:
+            groups.append({"members": [], "fade_in": clip["fade_frames"], "length": 0})
         groups[-1]["members"].append(i)
-        groups[-1]["length"] += clip["length"]
+        groups[-1]["length"] += clip["frames"]
 
     parts = []
     for g, group in enumerate(groups):
         ins = "".join(f"[{i}:v]" for i in group["members"])
         parts.append(f"{ins}concat=n={len(group['members'])}:v=1:a=0,settb=AVTB,fps={args.fps}[g{g}]")
 
-    cur, cur_len = "[g0]", groups[0]["length"]
+    fps, cur, cur_len = args.fps, "[g0]", groups[0]["length"]
     for g in range(1, len(groups)):
         d = groups[g]["fade_in"]
-        parts.append(f"{cur}[g{g}]xfade=transition=fade:duration={d}:offset={cur_len - d:.3f}[x{g}]")
+        parts.append(f"{cur}[g{g}]xfade=transition=fade:duration={d / fps:.6f}:"
+                     f"offset={(cur_len - d) / fps:.6f}[x{g}]")
         cur = f"[x{g}]"
         cur_len += groups[g]["length"] - d
 
     script = args.workdir / "assemble.filter"
     script.write_text(";\n".join(parts))
-    cmd = ["ffmpeg", "-v", "error", "-stats", "-y"]
+    # Encode beside the output and rename on success, so a failed run never clobbers a good file.
+    part = args.output.with_name(f".{args.output.stem}.part{args.output.suffix}")
+    cmd = ["ffmpeg", "-nostdin", "-v", "error", "-stats", "-y"]
     for f in clip_files:
         cmd += ["-i", str(f)]
     cmd += ["-/filter_complex", str(script), "-map", cur, "-an"]
     cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart", str(args.output)]
-    subprocess.run(cmd, check=True)
-    return cur_len
+            "-movflags", "+faststart", str(part)]
+    try:
+        subprocess.run(cmd, check=True)
+        os.replace(part, args.output)
+    finally:
+        part.unlink(missing_ok=True)
+    return cur_len / fps
 
 
 def parse_size(text):
@@ -268,26 +310,54 @@ def main():
     seed = args.seed if args.seed is not None else random.randrange(2**31)
     rng = random.Random(seed)
 
-    files, dataless = discover(args.sources)
+    # Only ever overwrite an earlier collage: anything else at -o may be an irreplaceable original.
+    plan_path = args.output.with_name(args.output.name + ".plan.json")
+    if args.output.exists() and not plan_path.exists():
+        sys.exit(f"{args.output} exists and is not an earlier collage (no {plan_path.name}); pick another -o")
+
+    files, dataless, collages = discover(args.sources)
     if dataless:
         print(f"skipping {dataless} iCloud placeholder(s) not downloaded to this Mac", file=sys.stderr)
+    if collages:
+        print(f"skipping {collages} earlier collage(s) (they have a .plan.json beside them)", file=sys.stderr)
     sources = probe_all(files, args.jobs)
     print(f"{len(sources)} usable source video(s); seed {seed}", file=sys.stderr)
     if not sources:
         sys.exit("nothing to work with")
 
     clips = plan_clips(sources, args, rng)
-    plan_path = args.output.with_name(args.output.name + ".plan.json")
-    plan_path.write_text(json.dumps({"seed": seed, "argv": sys.argv[1:], "clips": clips}, indent=1))
-
     args.workdir = Path(tempfile.mkdtemp(prefix="collage-"))
     try:
         print(f"rendering {len(clips)} clips with {args.jobs} jobs…", file=sys.stderr)
         with ThreadPoolExecutor(args.jobs) as pool:
-            clip_files = list(pool.map(lambda ic: render_clip(*ic, args, args.workdir), enumerate(clips)))
+            futures = [pool.submit(render_clip, i, clip, args, args.workdir) for i, clip in enumerate(clips)]
+        kept, clip_files = [], []
+        for i, (clip, future) in enumerate(zip(clips, futures)):
+            try:
+                clip_files.append(future.result())
+            except RuntimeError as err:
+                print(f"warning: dropping clip {i} ({clip['source']} at {clip['start']}s): {err}",
+                      file=sys.stderr)
+                clip.update(dropped=str(err), fade_frames=0, fade_in=0.0)
+                continue
+            # A dropped clip leaves its neighbours adjacent, so re-fit the fade to the new pair.
+            prev = kept[-1] if kept else None
+            clip["fade_frames"] = fit_fade(clip["fade_frames"], clip["frames"], prev["frames"]) if prev else 0
+            clip["fade_in"] = round(clip["fade_frames"] / args.fps, 4)
+            kept.append(clip)
+        if not kept:
+            sys.exit("every clip failed to render")
         print("assembling…", file=sys.stderr)
-        length = assemble(clip_files, clips, args)
-        print(f"wrote {args.output} ({length:.1f}s), plan in {plan_path}", file=sys.stderr)
+        planned = assemble(clip_files, kept, args)
+        # Written once the video is in place, so the plan beside -o always describes that video.
+        plan_path.write_text(json.dumps({"seed": seed, "argv": sys.argv[1:], "clips": clips}, indent=1))
+        actual = count_frames(args.output) / args.fps
+        print(f"wrote {args.output} ({actual:.1f}s), plan in {plan_path}", file=sys.stderr)
+        if abs(actual - planned) > 1.5 / args.fps:
+            print(f"warning: the plan was {planned:.1f}s long; the output is {actual:.1f}s", file=sys.stderr)
+        if len(kept) < len(clips):
+            print(f"warning: {len(clips) - len(kept)} of {len(clips)} clips were dropped, so the output is "
+                  f"shorter than planned", file=sys.stderr)
     finally:
         if args.keep_temp:
             print(f"clips kept in {args.workdir}", file=sys.stderr)
