@@ -119,12 +119,16 @@ def plan_clips(sources, args, rng):
     usable = [(p, m) for p, m in sources.items() if m["duration"] >= args.min_source]
     if not usable:
         sys.exit("no usable sources (all shorter than --min-source)")
+    # Longer videos come up more often, by the square root of their length so short ones still
+    # appear, and never the same video twice in a row (unless it is the only one).
+    weights = [math.sqrt(m["duration"]) for _, m in usable]
 
     # Lengths and fades are whole frames at --fps, so the xfade offsets computed in assemble()
     # land exactly on frames instead of drifting off the end of a group.
     fps, clips, timeline = args.fps, [], 0
     while timeline < args.duration * fps:
-        path, meta = rng.choice(usable)
+        prev = clips[-1]["source"] if clips and len(usable) > 1 else None
+        path, meta = rng.choices(usable, [0 if str(p) == prev else w for (p, _), w in zip(usable, weights)])[0]
         speed = 1.0
         if rng.random() < args.speed_prob:
             speed = math.exp(rng.uniform(math.log(args.speed_min), math.log(args.speed_max)))
