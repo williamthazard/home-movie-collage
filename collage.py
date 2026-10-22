@@ -31,6 +31,13 @@ SF_DATALESS = 0x40000000  # macOS st_flags bit for iCloud files whose data is no
 CACHE_PATH = Path(__file__).with_name(".probe-cache.json")
 PROBE_VERSION = 2  # bump when probe() records new fields, so cached entries get probed again
 HDR_TRANSFERS = {"arib-std-b67": "hlg", "smpte2084": "pq"}  # ffprobe color_transfer -> plan name
+H264 = ["-c:v", "libx264", "-preset", "medium", "-crf", "18"]
+FASTSTART = ["-movflags", "+faststart"]  # index at the front, so playback starts before the download ends
+# Encoder for each output extension. WebM cannot hold H.264, so it gets VP9: at CRF 18 it matches
+# x264's hardest frames on real collage footage, in 40-75% of the size and about twice the encode time.
+ENCODERS = {".mp4": H264 + FASTSTART, ".m4v": H264 + FASTSTART, ".mov": H264 + FASTSTART,
+            ".mkv": H264, ".avi": H264, ".ts": H264,
+            ".webm": ["-c:v", "libvpx-vp9", "-crf", "18", "-b:v", "0", "-row-mt", "1", "-cpu-used", "2"]}
 BT2020_LUMA = (0.2627, 0.678, 0.0593)
 BT2020_TO_BT709 = ((1.660491, -0.587641, -0.072850),  # linear-light primaries conversion, BT.2087
                    (-0.124550, 1.132900, -0.008349),
@@ -160,11 +167,20 @@ def probe_all(files, jobs):
     return {f: cache[keyed[f]] for f in files if cache.get(keyed[f])}
 
 
-def fit_fade(frames, clip_frames, prev_frames):
-    """Cap a crossfade at 45% of both clips it overlaps. xfade silently drops the outgoing side
-    when its offset passes that side's last frame, so a fade under 2 frames becomes a hard cut."""
-    frames = int(min(frames, 0.45 * min(clip_frames, prev_frames)))
-    return frames if frames >= 2 else 0
+def shortest_fade(args):
+    """--fade-min in whole frames, rounded up, and never under 2: one blended frame is no fade."""
+    return max(2, math.ceil(args.fade_min * args.fps - 1e-6))
+
+
+def fit_fade(frames, clip_frames, prev_frames, shortest):
+    """Fit a crossfade of `frames` between two clips, or return 0 for a hard cut. A fade may take
+    at most 45% of either clip, so a clip's fade-in and fade-out never meet and xfade never runs
+    past a clip's last frame (it would silently drop the clip). When that leaves no room for the
+    shortest allowed fade, the clips are joined with a hard cut instead of a shorter fade."""
+    room = int(0.45 * min(clip_frames, prev_frames))
+    if not frames or room < shortest:
+        return 0
+    return max(shortest, min(int(frames), room))
 
 
 def plan_clips(sources, args, rng):
@@ -179,7 +195,7 @@ def plan_clips(sources, args, rng):
 
     # Lengths and fades are whole frames at --fps, so the xfade offsets computed in assemble()
     # land exactly on frames instead of drifting off the end of a group.
-    fps, clips, timeline = args.fps, [], 0
+    fps, clips, timeline, shortest = args.fps, [], 0, shortest_fade(args)
     while timeline < args.duration * fps:
         prev = clips[-1]["source"] if clips and len(usable) > 1 else None
         path, meta = rng.choices(usable, [0 if str(p) == prev else w for (p, _), w in zip(usable, weights)])[0]
@@ -214,7 +230,8 @@ def plan_clips(sources, args, rng):
 
         fade = 0
         if clips and rng.random() < args.fade_prob:
-            fade = fit_fade(rng.uniform(args.fade_min, args.fade_max) * fps, frames, clips[-1]["frames"])
+            drawn = rng.uniform(args.fade_min, args.fade_max) * fps
+            fade = fit_fade(drawn, frames, clips[-1]["frames"], shortest)
         clips.append({
             "source": str(path),
             "start": round(start, 3),
@@ -309,7 +326,9 @@ def count_frames(path):
          "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path)],
         capture_output=True, text=True,
     )
-    return int(out.stdout) if out.stdout.strip().isdigit() else 0
+    # MPEG-TS lists its stream twice (inside its program and on its own): take the first count.
+    counts = out.stdout.split()
+    return int(counts[0]) if counts and counts[0].isdigit() else 0
 
 
 def render_clip(index, clip, args, workdir):
@@ -377,9 +396,8 @@ def assemble(clip_files, clips, args):
     if len(clip_files) > 400:
         cmd += ["-filter_complex_threads", "1"]
     cmd += ["-/filter_complex", str(script), "-map", cur, "-an"]
-    cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
-            "-movflags", "+faststart", str(part)]
+    cmd += ENCODERS[args.output.suffix.lower()] + ["-pix_fmt", "yuv420p", "-colorspace", "bt709",
+            "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv", str(part)]
     try:
         subprocess.run(cmd, check=True)
         os.replace(part, args.output)
@@ -403,7 +421,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("sources", nargs="+", help="video files and/or folders (searched recursively)")
     ap.add_argument("-o", "--output", type=Path, default=Path("collage.mp4"),
-                    help="output video; only ever replaces an earlier collage")
+                    help=f"output video ({', '.join(ENCODERS)}); only ever replaces an earlier collage")
     ap.add_argument("-d", "--duration", type=float, default=60, help="target length in seconds")
     ap.add_argument("--seed", type=int, help="random seed (printed if omitted)")
     ap.add_argument("--size", type=parse_size, default=(1280, 720), help="output WxH")
@@ -420,7 +438,8 @@ def main():
     ap.add_argument("--rotate-max", type=float, default=180.0,
                     help="rotated clips get a random angle in ±this many degrees")
     ap.add_argument("--fade-prob", type=float, default=0.35, help="chance a clip crossfades in")
-    ap.add_argument("--fade-min", type=float, default=0.4, help="shortest crossfade, seconds")
+    ap.add_argument("--fade-min", type=float, default=0.4,
+                    help="shortest crossfade, seconds; clips too short for one get a hard cut")
     ap.add_argument("--fade-max", type=float, default=2.5, help="longest crossfade, seconds")
     ap.add_argument("-j", "--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--keep-temp", action="store_true", help="keep rendered clips")
@@ -437,6 +456,8 @@ def main():
         ap.error("--speed-prob, --rotate-prob and --fade-prob must be between 0 and 1")
     if not (args.duration > 0 and args.fps > 0 and args.jobs >= 1 and args.rotate_max >= 0):
         ap.error("need --duration > 0, --fps > 0, --jobs >= 1 and --rotate-max >= 0")
+    if args.output.suffix.lower() not in ENCODERS:
+        ap.error(f"-o {args.output.name}: the name must end in one of {', '.join(ENCODERS)}")
 
     seed = args.seed if args.seed is not None else random.randrange(2**31)
     rng = random.Random(seed)
@@ -473,7 +494,8 @@ def main():
                 continue
             # A dropped clip leaves its neighbours adjacent, so re-fit the fade to the new pair.
             prev = kept[-1] if kept else None
-            clip["fade_frames"] = fit_fade(clip["fade_frames"], clip["frames"], prev["frames"]) if prev else 0
+            clip["fade_frames"] = (fit_fade(clip["fade_frames"], clip["frames"], prev["frames"], shortest_fade(args))
+                                   if prev else 0)
             clip["fade_in"] = round(clip["fade_frames"] / args.fps, 4)
             kept.append(clip)
         if not kept:
