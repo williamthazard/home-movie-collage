@@ -18,6 +18,7 @@ import json
 import math
 import os
 import random
+import resource
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,12 @@ from pathlib import Path
 VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".mkv", ".avi", ".webm", ".mts", ".m2ts", ".3gp"}
 SF_DATALESS = 0x40000000  # macOS st_flags bit for iCloud files whose data is not on disk
 CACHE_PATH = Path(__file__).with_name(".probe-cache.json")
+PROBE_VERSION = 2  # bump when probe() records new fields, so cached entries get probed again
+HDR_TRANSFERS = {"arib-std-b67": "hlg", "smpte2084": "pq"}  # ffprobe color_transfer -> plan name
+BT2020_LUMA = (0.2627, 0.678, 0.0593)
+BT2020_TO_BT709 = ((1.660491, -0.587641, -0.072850),  # linear-light primaries conversion, BT.2087
+                   (-0.124550, 1.132900, -0.008349),
+                   (-0.018151, -0.100579, 1.118730))
 
 
 def discover(paths):
@@ -51,7 +58,12 @@ def discover(paths):
         for p in candidates:
             if p.suffix.lower() not in VIDEO_EXTS or p.name.startswith("."):
                 continue
-            if getattr(p.stat(), "st_flags", 0) & SF_DATALESS:
+            try:
+                flags = getattr(p.stat(), "st_flags", 0)
+            except OSError as err:  # a broken symlink, or a file that vanished mid-walk
+                print(f"warning: skipping {p}: {err.strerror}", file=sys.stderr)
+                continue
+            if flags & SF_DATALESS:
                 dataless += 1
                 continue
             if p.with_name(p.name + ".plan.json").exists():
@@ -68,41 +80,83 @@ def probe(path):
     )
     if out.returncode != 0:
         return None
-    info = json.loads(out.stdout)
+    try:
+        return video_meta(json.loads(out.stdout))
+    except (ValueError, KeyError, TypeError):
+        return None  # odd metadata: skip this file rather than abort the whole run
+
+
+def video_meta(info):
     video = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"
                   and not s.get("disposition", {}).get("attached_pic")), None)
     if video is None:
         return None
     duration = float(video.get("duration") or info.get("format", {}).get("duration") or 0)
-    if duration <= 0:
+    if not 0 < duration < math.inf:
         return None
     rotation = 0
     for sd in video.get("side_data_list", []):
         if "rotation" in sd:
-            rotation = int(sd["rotation"])
-    rotation = rotation or int(video.get("tags", {}).get("rotate", 0))
+            rotation = round(float(sd["rotation"]))
+    rotation = rotation or round(float(video.get("tags", {}).get("rotate", 0)))
     w, h = int(video["width"]), int(video["height"])
+    # Untagged video decodes as BT.601 in ffmpeg, but players treat untagged HD as BT.709: match them.
+    tagged = video.get("color_space") not in (None, "", "unknown", "reserved")
+    matrix = "" if tagged else "bt709" if w >= 1280 or h > 576 else "bt601"
     num, _, den = (video.get("sample_aspect_ratio") or "1:1").partition(":")
     sar = (int(num) / int(den)) if num.isdigit() and den.isdigit() and int(num) and int(den) else 1.0
     w = round(w * sar)  # display width; clips apply the same SAR correction before cropping
+    if w < 2 or h < 2:
+        return None  # no window to cut (checked after SAR, which can squeeze the width under 2)
     if abs(rotation) % 180 == 90:
         w, h = h, w  # ffmpeg auto-rotates on decode, so plan in display orientation
-    return {"duration": duration, "width": w, "height": h, "sar": sar}
+    return {"duration": duration, "width": w, "height": h, "sar": sar, "matrix": matrix,
+            "hdr": HDR_TRANSFERS.get(video.get("color_transfer"), ""),
+            "interlaced": video.get("field_order") in ("tt", "bb", "tb", "bt")}
+
+
+def cached_meta_ok(meta):
+    """Is a cache entry something video_meta() could have returned: None or a well-formed dict?"""
+    if meta is None:
+        return True  # probed before and not a usable video
+    try:
+        return (0 < meta["duration"] < math.inf and meta["sar"] > 0 and meta["width"] >= 2
+                and meta["height"] >= 2 and meta["matrix"] in ("", "bt709", "bt601")
+                and meta["hdr"] in ("", *HDR_TRANSFERS.values()) and isinstance(meta["interlaced"], bool))
+    except (KeyError, TypeError):
+        return False
 
 
 def probe_all(files, jobs):
-    cache = json.loads(CACHE_PATH.read_text()) if CACHE_PATH.exists() else {}
+    try:
+        cache = json.loads(CACHE_PATH.read_text())
+    except (OSError, ValueError):
+        cache = {}  # missing, unreadable or corrupt: probing again is cheap
+    version = f"v{PROBE_VERSION}|"
+    # Keep only well-formed entries from this version; anything else is probed again.
+    cache = {k: v for k, v in cache.items()
+             if k.startswith(version) and cached_meta_ok(v)} if isinstance(cache, dict) else {}
     keyed = {}
     for f in files:
         st = f.stat()
-        keyed[f] = f"{f}|{st.st_size}|{int(st.st_mtime)}"
+        keyed[f] = f"{version}{f}|{st.st_size}|{int(st.st_mtime)}"
     missing = [f for f in files if keyed[f] not in cache]
     if missing:
         print(f"probing {len(missing)} new file(s)…", file=sys.stderr)
         with ThreadPoolExecutor(jobs) as pool:
             for f, meta in zip(missing, pool.map(probe, missing)):
                 cache[keyed[f]] = meta
-        CACHE_PATH.write_text(json.dumps(cache))
+        # Write a temp file and rename it, so an interrupted or concurrent run can't leave half a file.
+        tmp = CACHE_PATH.with_name(f"{CACHE_PATH.name}.{os.getpid()}")
+        try:
+            tmp.write_text(json.dumps(cache))
+            os.replace(tmp, CACHE_PATH)
+        except OSError as err:
+            print(f"warning: cannot save the probe cache: {err.strerror}", file=sys.stderr)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
     return {f: cache[keyed[f]] for f in files if cache.get(keyed[f])}
 
 
@@ -134,7 +188,7 @@ def plan_clips(sources, args, rng):
             speed = math.exp(rng.uniform(math.log(args.speed_min), math.log(args.speed_max)))
         # `span` is the stretch of source consumed; the clip plays it back in span / speed seconds.
         span = min(rng.uniform(args.clip_min, args.clip_max) * speed, meta["duration"] - 0.05)
-        frames = max(1, int(span / speed * fps))
+        frames = max(2, int(span / speed * fps))  # a lone frame has no duration and vanishes when joined
         length = frames / fps
         span = length * speed
         start = rng.uniform(0, max(0.0, meta["duration"] - span))
@@ -175,27 +229,72 @@ def plan_clips(sources, args, rng):
             "fade_frames": fade,
             "sar": meta["sar"],
             "source_size": [sw, sh],
+            "matrix": meta["matrix"],
+            "hdr": meta["hdr"],
+            "interlaced": meta["interlaced"],
         })
         timeline += frames - fade
     return clips
 
 
+def lut(expr):
+    return "lutrgb=" + ":".join(f"{c}='{expr}'" for c in "rgb")
+
+
+def hdr_to_sdr(hdr, w, h):
+    """Filters that scale an HLG or PQ frame (BT.2020, 10-bit) to w x h as BT.709 SDR. This
+    ffmpeg has no zscale or libplacebo, and its scale filter's own colour management mutes
+    saturated colours, so it is done by hand in 16-bit linear RGB per BT.2100 and BT.2408:
+    decode to display light with 1.0 at SDR white (HLG 75%, PQ 203 nits), convert the primaries,
+    roll highlights off above 95% of white, and encode with gamma 2.4."""
+    x = "(val/maxval)"
+    if hdr == "hlg":
+        # Inverse OETF, then the OOTF for a 1000-nit display (system gamma 1.2): each pixel is
+        # scaled by its luminance^0.2, which takes a split and a multiply blend. Stored as nits/1000.
+        a, b, c = 0.17883277, 0.28466892, 0.55991073
+        top = 1000 / 203
+        luma = "colorchannelmixer=" + ":".join(f"{o}{i}={k}" for o in "rgb" for i, k in zip("rgb", BT2020_LUMA))
+        decode = (lut(f"maxval*if(lte({x},0.5),{x}*{x}/3,(exp(({x}-{c})/{a})+{b})/12)") +
+                  f",split[e][f];[f]{luma},{lut(f'maxval*pow({x},0.2)')}[y];[e][y]blend=all_mode=multiply")
+    else:
+        # The PQ EOTF in units of 203 nits, clipped at twice that and stored halved.
+        top = 2
+        p = f"pow({x},1/78.84375)"
+        light = f"{10000 / 203}*pow(max({p}-0.8359375,0)/(18.8515625-18.6875*{p}),1/0.1593017578125)"
+        decode = lut(f"maxval*min({light},{top})/{top}")
+    mix = "colorchannelmixer=" + ":".join(
+        f"{o}{i}={k}" for o, row in zip("rgb", BT2020_TO_BT709) for i, k in zip("rgb", row))
+    v = f"({x}*{top})"
+    knee = f"min(if(lte({v},0.95),{v},0.95+0.05*(1-exp(-({v}-0.95)/0.05))),1)"
+    return (f"scale={w}:{h}:flags=bicubic+accurate_rnd+full_chroma_int:in_color_matrix=bt2020:in_range=tv:"
+            f"out_range=pc,format=gbrp16le,{decode},{mix},{lut(f'maxval*pow({knee},1/2.4)')},"
+            "scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd")
+
+
 def clip_filter(clip, args, trim=0.0):
-    """Video filter chain: drop `trim` seconds decoded before the clip's start, retime, crop the
-    window's bounding box, rotate so the window is upright and cut out, then scale it up to the
-    output size. Timestamps are always rebased: a seek can deliver a first frame after 0."""
+    """Video filtergraph: deinterlace camcorder footage, drop `trim` seconds decoded before the
+    clip's start, retime, crop the window's bounding box, rotate so the window is upright and cut
+    out, then scale it up to the output size as BT.709 SDR. Timestamps are always rebased: a seek
+    can deliver a first frame after 0."""
     out_w, out_h = args.size
     cw, ch = clip["window"]
     bw, bh, bx, by = clip["box"]
-    chain = [f"trim=start={trim:.3f}"] if trim else []
+    # Deinterlace before anything resamples the picture, while the two fields are still intact.
+    chain = ["bwdif=mode=send_frame:deint=all"] if clip.get("interlaced") else []
+    if trim:
+        chain.append(f"trim=start={trim:.3f}")
     chain.append(f"setpts=(PTS-STARTPTS)/{clip['speed']}")
     if abs(clip["sar"] - 1.0) > 1e-3:
         chain.append(f"scale={clip['source_size'][0]}:ih,setsar=1")
     chain.append(f"crop={bw}:{bh}:{bx}:{by}")
     if clip["rotation"]:
         chain.append(f"rotate={math.radians(clip['rotation']):.5f}:ow={cw}:oh={ch}")
+    # Everything leaves as BT.709 SDR: HDR is tone-mapped, and SD footage's BT.601 matrix converted.
+    matrix = f"in_color_matrix={clip['matrix']}:" if clip.get("matrix") else ""
     chain += [
-        f"scale={out_w}:{out_h}:flags=bicubic",
+        hdr_to_sdr(clip["hdr"], out_w, out_h) if clip.get("hdr")
+        else f"scale={out_w}:{out_h}:flags=bicubic:{matrix}out_color_matrix=bt709:out_range=tv",
+        "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv",
         "setsar=1",
         f"fps={args.fps}",
         f"tpad=stop_mode=clone:stop_duration={clip['length']}",
@@ -219,7 +318,9 @@ def render_clip(index, clip, args, workdir):
     one near the end of a file can come out empty while ffmpeg still exits 0. Every attempt is
     checked by counting frames; retries seek further back, then from the top, and trim up to
     the planned start."""
-    out = workdir / f"clip{index:05d}.mkv"
+    # NUT keeps exact 1/fps timestamps. Matroska rounds them to whole milliseconds, so a long run
+    # of hard cuts gains or loses about a frame per hundred clips when assemble() joins them.
+    out = workdir / f"clip{index:05d}.nut"
     start = clip["start"]
     for seek in sorted({start, max(0.0, start - 10), 0.0}, reverse=True):
         cmd = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-ss", f"{seek:.3f}", "-i", clip["source"],
@@ -257,24 +358,41 @@ def assemble(clip_files, clips, args):
 
     script = args.workdir / "assemble.filter"
     script.write_text(";\n".join(parts))
+    # Every clip is an open input: lift the open-file limit (macOS Terminal defaults to 256), and
+    # decode each on one thread, or ffmpeg hits macOS's 4096 threads per process. That still leaves
+    # about 6 threads per clip; single-threaded filters bring it to 2 (1010 clips used to fail, 2000
+    # now work) but assemble about a third slower, so only long collages get them.
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    need = min(len(clip_files) + 256, hard)  # RLIM_INFINITY is just a very large number
+    if soft < need:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (need, hard))
+        except (ValueError, OSError):
+            pass  # ffmpeg will say so if it really runs out
     # Encode beside the output and rename on success, so a failed run never clobbers a good file.
     part = args.output.with_name(f".{args.output.stem}.part{args.output.suffix}")
     cmd = ["ffmpeg", "-nostdin", "-v", "error", "-stats", "-y"]
     for f in clip_files:
-        cmd += ["-i", str(f)]
+        cmd += ["-threads", "1", "-i", str(f)]
+    if len(clip_files) > 400:
+        cmd += ["-filter_complex_threads", "1"]
     cmd += ["-/filter_complex", str(script), "-map", cur, "-an"]
     cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
             "-movflags", "+faststart", str(part)]
     try:
         subprocess.run(cmd, check=True)
         os.replace(part, args.output)
     finally:
         part.unlink(missing_ok=True)
-    return cur_len / fps
+    return cur_len
 
 
 def parse_size(text):
-    w, _, h = text.lower().partition("x")
+    w, _, h = text.strip().lower().partition("x")
+    w, h = w.strip(), h.strip()
+    if not (w.isdigit() and h.isdigit() and int(w) and int(h)):
+        raise argparse.ArgumentTypeError(f"{text!r} is not WxH, e.g. 1280x720")
     w, h = int(w), int(h)
     if w % 2 or h % 2:
         raise argparse.ArgumentTypeError("size must have even dimensions")
@@ -284,7 +402,8 @@ def parse_size(text):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("sources", nargs="+", help="video files and/or folders (searched recursively)")
-    ap.add_argument("-o", "--output", type=Path, default=Path("collage.mp4"))
+    ap.add_argument("-o", "--output", type=Path, default=Path("collage.mp4"),
+                    help="output video; only ever replaces an earlier collage")
     ap.add_argument("-d", "--duration", type=float, default=60, help="target length in seconds")
     ap.add_argument("--seed", type=int, help="random seed (printed if omitted)")
     ap.add_argument("--size", type=parse_size, default=(1280, 720), help="output WxH")
@@ -306,10 +425,18 @@ def main():
     ap.add_argument("-j", "--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--keep-temp", action="store_true", help="keep rendered clips")
     args = ap.parse_args()
+    if not all(math.isfinite(v) for v in vars(args).values() if isinstance(v, float)):
+        ap.error("numbers must be finite (inf and nan are not allowed)")
     if not (0 < args.clip_min <= args.clip_max and 1 <= args.zoom_min <= args.zoom_max):
         ap.error("need 0 < clip-min <= clip-max and 1 <= zoom-min <= zoom-max")
     if not (0 < args.speed_min <= args.speed_max):
         ap.error("need 0 < speed-min <= speed-max")
+    if not (0 <= args.fade_min <= args.fade_max):
+        ap.error("need 0 <= fade-min <= fade-max")
+    if not all(0 <= p <= 1 for p in (args.speed_prob, args.rotate_prob, args.fade_prob)):
+        ap.error("--speed-prob, --rotate-prob and --fade-prob must be between 0 and 1")
+    if not (args.duration > 0 and args.fps > 0 and args.jobs >= 1 and args.rotate_max >= 0):
+        ap.error("need --duration > 0, --fps > 0, --jobs >= 1 and --rotate-max >= 0")
 
     seed = args.seed if args.seed is not None else random.randrange(2**31)
     rng = random.Random(seed)
@@ -352,13 +479,18 @@ def main():
         if not kept:
             sys.exit("every clip failed to render")
         print("assembling…", file=sys.stderr)
-        planned = assemble(clip_files, kept, args)
+        try:
+            planned = assemble(clip_files, kept, args)
+        except subprocess.CalledProcessError:
+            sys.exit(f"ffmpeg failed joining the {len(kept)} clips (its error is above); "
+                     f"if that is a resource limit, try a shorter -d or a longer --clip-min")
         # Written once the video is in place, so the plan beside -o always describes that video.
         plan_path.write_text(json.dumps({"seed": seed, "argv": sys.argv[1:], "clips": clips}, indent=1))
-        actual = count_frames(args.output) / args.fps
-        print(f"wrote {args.output} ({actual:.1f}s), plan in {plan_path}", file=sys.stderr)
-        if abs(actual - planned) > 1.5 / args.fps:
-            print(f"warning: the plan was {planned:.1f}s long; the output is {actual:.1f}s", file=sys.stderr)
+        actual = count_frames(args.output)
+        print(f"wrote {args.output} ({actual / args.fps:.1f}s), plan in {plan_path}", file=sys.stderr)
+        if actual != planned:
+            print(f"warning: the plan was {planned} frames ({planned / args.fps:.1f}s); "
+                  f"the output has {actual}", file=sys.stderr)
         if len(kept) < len(clips):
             print(f"warning: {len(clips) - len(kept)} of {len(clips)} clips were dropped, so the output is "
                   f"shorter than planned", file=sys.stderr)
