@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "home-movie-collage"
+version = "0.1.0"
+description = "Turn a folder of home movies into a random, heavily zoomed, silent video collage (uses ffmpeg)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "williamthazard" }]
+requires-python = ">=3.9"
+dependencies = []
+keywords = ["video", "collage", "ffmpeg", "home movies"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video",
+]
+
+[project.urls]
+Homepage = "https://github.com/williamthazard/home-movie-collage"
+
+[project.scripts]
+home-movie-collage = "home_movie_collage:main"
+
+[tool.setuptools]
+py-modules = ["home_movie_collage"]

@@ -1,5 +1,11 @@
-# rendered collages, their plans, and the ffprobe cache
+# rendered collages, their plans, and the ffprobe cache (older versions kept it here)
 *.mp4
 *.plan.json
 .probe-cache.json
 .*.part.*
+
+# Python packaging leftovers
+__pycache__/
+build/
+dist/
+*.egg-info/

@@ -3,7 +3,8 @@
 
 Pipeline:
   1. discover video files under the given paths (skipping iCloud placeholders and earlier collages),
-  2. ffprobe each one (cached in .probe-cache.json next to this script),
+  2. ffprobe each one (cached in ~/Library/Caches/home-movie-collage on macOS,
+     ~/.cache/home-movie-collage on Linux, or under LOCALAPPDATA on Windows),
   3. plan random clips in whole frames: source, start, length, speed, rotation, fixed zoom window,
      transition,
   4. render every clip to a normalized intermediate in parallel, dropping any that fail,
@@ -18,17 +19,25 @@ import json
 import math
 import os
 import random
-import resource
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from importlib import metadata
 from pathlib import Path
+
+try:
+    import resource  # Unix only: lets assemble() lift the open-file limit for long collages
+except ImportError:
+    resource = None
 
 VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".mkv", ".avi", ".webm", ".mts", ".m2ts", ".3gp"}
 SF_DATALESS = 0x40000000  # macOS st_flags bit for iCloud files whose data is not on disk
-CACHE_PATH = Path(__file__).with_name(".probe-cache.json")
+MIN_FFMPEG = 7  # assemble() reads its filtergraph with the -/filter_complex syntax ffmpeg 7.0 introduced
+FFMPEG_HINT = ("on macOS run `brew install ffmpeg`, on Windows `winget install Gyan.FFmpeg`; "
+               "for Linux see https://github.com/williamthazard/home-movie-collage#install")
 PROBE_VERSION = 2  # bump when probe() records new fields, so cached entries get probed again
 HDR_TRANSFERS = {"arib-std-b67": "hlg", "smpte2084": "pq"}  # ffprobe color_transfer -> plan name
 SIZE_PRESETS = {"landscape": (1280, 720), "square": (720, 720), "portrait": (720, 1280)}  # --size names
@@ -137,9 +146,23 @@ def cached_meta_ok(meta):
         return False
 
 
+def cache_path():
+    """The ffprobe cache file: under $XDG_CACHE_HOME if set, else the platform's per-user cache folder."""
+    if os.environ.get("XDG_CACHE_HOME"):
+        base = Path(os.environ["XDG_CACHE_HOME"])
+    elif sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Caches"
+    else:
+        base = Path.home() / ".cache"
+    return base / "home-movie-collage" / "probe-cache.json"
+
+
 def probe_all(files, jobs):
+    cache_file = cache_path()
     try:
-        cache = json.loads(CACHE_PATH.read_text())
+        cache = json.loads(cache_file.read_text())
     except (OSError, ValueError):
         cache = {}  # missing, unreadable or corrupt: probing again is cheap
     version = f"v{PROBE_VERSION}|"
@@ -157,10 +180,11 @@ def probe_all(files, jobs):
             for f, meta in zip(missing, pool.map(probe, missing)):
                 cache[keyed[f]] = meta
         # Write a temp file and rename it, so an interrupted or concurrent run can't leave half a file.
-        tmp = CACHE_PATH.with_name(f"{CACHE_PATH.name}.{os.getpid()}")
+        tmp = cache_file.with_name(f"{cache_file.name}.{os.getpid()}")
         try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(cache))
-            os.replace(tmp, CACHE_PATH)
+            os.replace(tmp, cache_file)
         except OSError as err:
             print(f"warning: cannot save the probe cache: {err.strerror}", file=sys.stderr)
             try:
@@ -386,28 +410,36 @@ def assemble(clip_files, clips, args):
     # decode each on one thread, or ffmpeg hits macOS's 4096 threads per process. That still leaves
     # about 6 threads per clip; single-threaded filters bring it to 2 (1010 clips used to fail, 2000
     # now work) but assemble about a third slower, so only long collages get them.
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    need = min(len(clip_files) + 256, hard)  # RLIM_INFINITY is just a very large number
-    if soft < need:
-        try:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (need, hard))
-        except (ValueError, OSError):
-            pass  # ffmpeg will say so if it really runs out
+    if resource:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        need = min(len(clip_files) + 256, hard)  # RLIM_INFINITY is just a very large number
+        if soft < need:
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (need, hard))
+            except (ValueError, OSError):
+                pass  # ffmpeg will say so if it really runs out
     # Encode beside the output and rename on success, so a failed run never clobbers a good file.
-    part = args.output.with_name(f".{args.output.stem}.part{args.output.suffix}")
+    # (abspath, not resolve(): before Python 3.10, Windows leaves a missing file's path relative.)
+    part = Path(os.path.abspath(args.output)).with_name(f".{args.output.stem}.part{args.output.suffix}")
+    # ffmpeg runs in the work folder so inputs are bare names: Windows caps a command line at
+    # 32,767 characters, which full temp paths would reach at about 400 clips.
     cmd = ["ffmpeg", "-nostdin", "-v", "error", "-stats", "-y"]
     for f in clip_files:
-        cmd += ["-threads", "1", "-i", str(f)]
+        cmd += ["-threads", "1", "-i", f.name]
     if len(clip_files) > 400:
         cmd += ["-filter_complex_threads", "1"]
-    cmd += ["-/filter_complex", str(script), "-map", cur, "-an"]
+    cmd += ["-/filter_complex", script.name, "-map", cur, "-an"]
     cmd += ENCODERS[args.output.suffix.lower()] + ["-pix_fmt", "yuv420p", "-colorspace", "bt709",
             "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv", str(part)]
     try:
-        subprocess.run(cmd, check=True)
-        os.replace(part, args.output)
-    finally:
+        subprocess.run(cmd, check=True, cwd=args.workdir)
+    except BaseException:
         part.unlink(missing_ok=True)
+        raise
+    try:
+        os.replace(part, args.output)
+    except OSError as err:  # on Windows, e.g. while the previous collage is still open in a player
+        sys.exit(f"cannot replace {args.output} ({err.strerror}); the new collage was kept as {part}")
     return cur_len
 
 
@@ -423,6 +455,32 @@ def parse_size(text):
     if w % 2 or h % 2:
         raise argparse.ArgumentTypeError("size must have even dimensions")
     return w, h
+
+
+def check_ffmpeg(output_ext):
+    """Stop early, with an install hint, if ffmpeg is missing, too old or lacks an encoder we need."""
+    missing = [tool for tool in ("ffmpeg", "ffprobe") if not shutil.which(tool)]
+    if missing:
+        sys.exit(f"{' and '.join(missing)} not found: {FFMPEG_HINT}")
+    try:
+        banner = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, check=True).stdout
+        encoders = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                                  capture_output=True, text=True, check=True).stdout.split()
+    except (OSError, subprocess.CalledProcessError) as err:
+        sys.exit(f"ffmpeg is there but does not run ({err}): {FFMPEG_HINT}")
+    version = re.match(r"ffmpeg version (n?(\d+)\.\S*)", banner)  # git builds print no number: let them by
+    if version and int(version.group(2)) < MIN_FFMPEG:
+        sys.exit(f"this needs ffmpeg {MIN_FFMPEG} or newer, but found {version.group(1)}: {FFMPEG_HINT}")
+    for name, use in (("libx264", "every clip"), (ENCODERS[output_ext][1], f"{output_ext} output")):
+        if name not in encoders:
+            sys.exit(f"this ffmpeg has no {name} encoder, which {use} needs: {FFMPEG_HINT}")
+
+
+def package_version():
+    try:
+        return metadata.version("home-movie-collage")
+    except metadata.PackageNotFoundError:
+        return "(run from source)"
 
 
 def main():
@@ -457,6 +515,7 @@ def main():
                     help="make every crossfade this long instead of a random length (--fade-prob sets how often)")
     ap.add_argument("-j", "--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--keep-temp", action="store_true", help="keep rendered clips")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {package_version()}")
     args = ap.parse_args()
     # --clip, --zoom and --fade pin a range to one value; otherwise unset bounds take their defaults.
     for name, (low, high) in RANGES.items():
@@ -483,6 +542,9 @@ def main():
         ap.error("need --duration > 0, --fps > 0, --jobs >= 1 and --rotate-max >= 0")
     if args.output.suffix.lower() not in ENCODERS:
         ap.error(f"-o {args.output.name}: the name must end in one of {', '.join(ENCODERS)}")
+    if not args.output.parent.is_dir():
+        ap.error(f"-o {args.output}: the folder {args.output.parent} does not exist")
+    check_ffmpeg(args.output.suffix.lower())
 
     seed = args.seed if args.seed is not None else random.randrange(2**31)
     rng = random.Random(seed)
