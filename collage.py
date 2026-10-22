@@ -31,6 +31,9 @@ SF_DATALESS = 0x40000000  # macOS st_flags bit for iCloud files whose data is no
 CACHE_PATH = Path(__file__).with_name(".probe-cache.json")
 PROBE_VERSION = 2  # bump when probe() records new fields, so cached entries get probed again
 HDR_TRANSFERS = {"arib-std-b67": "hlg", "smpte2084": "pq"}  # ffprobe color_transfer -> plan name
+SIZE_PRESETS = {"landscape": (1280, 720), "square": (720, 720), "portrait": (720, 1280)}  # --size names
+# Random ranges that --clip, --zoom and --fade can pin to one value: name -> default (min, max).
+RANGES = {"clip": (1.5, 6.0), "zoom": (2.5, 7.0), "fade": (0.4, 2.5)}
 H264 = ["-c:v", "libx264", "-preset", "medium", "-crf", "18"]
 FASTSTART = ["-movflags", "+faststart"]  # index at the front, so playback starts before the download ends
 # Encoder for each output extension. WebM cannot hold H.264, so it gets VP9: at CRF 18 it matches
@@ -409,10 +412,13 @@ def assemble(clip_files, clips, args):
 
 
 def parse_size(text):
+    if text.strip().lower() in SIZE_PRESETS:
+        return SIZE_PRESETS[text.strip().lower()]
     w, _, h = text.strip().lower().partition("x")
     w, h = w.strip(), h.strip()
     if not (w.isdigit() and h.isdigit() and int(w) and int(h)):
-        raise argparse.ArgumentTypeError(f"{text!r} is not WxH, e.g. 1280x720")
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not WxH (e.g. 1280x720) or one of {', '.join(SIZE_PRESETS)}")
     w, h = int(w), int(h)
     if w % 2 or h % 2:
         raise argparse.ArgumentTypeError("size must have even dimensions")
@@ -426,13 +432,17 @@ def main():
                     help=f"output video ({', '.join(ENCODERS)}); only ever replaces an earlier collage")
     ap.add_argument("-d", "--duration", type=float, default=60, help="target length in seconds")
     ap.add_argument("--seed", type=int, help="random seed (printed if omitted)")
-    ap.add_argument("--size", type=parse_size, default=(1280, 720), help="output WxH")
+    ap.add_argument("--size", type=parse_size, default=SIZE_PRESETS["landscape"],
+                    help="output WxH, or " + ", ".join(f"{k} ({w}x{h})" for k, (w, h) in SIZE_PRESETS.items())
+                    + "; default landscape")
     ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--clip-min", type=float, default=1.5, help="shortest clip, seconds")
-    ap.add_argument("--clip-max", type=float, default=6.0, help="longest clip, seconds")
+    ap.add_argument("--clip-min", type=float, help=f"shortest clip, seconds (default {RANGES['clip'][0]:g})")
+    ap.add_argument("--clip-max", type=float, help=f"longest clip, seconds (default {RANGES['clip'][1]:g})")
+    ap.add_argument("--clip", type=float, help="give every clip this length instead of a random one")
     ap.add_argument("--min-source", type=float, default=1.0, help="ignore sources shorter than this")
-    ap.add_argument("--zoom-min", type=float, default=2.5, help="smallest zoom factor")
-    ap.add_argument("--zoom-max", type=float, default=7.0, help="largest zoom factor")
+    ap.add_argument("--zoom-min", type=float, help=f"smallest zoom factor (default {RANGES['zoom'][0]:g})")
+    ap.add_argument("--zoom-max", type=float, help=f"largest zoom factor (default {RANGES['zoom'][1]:g})")
+    ap.add_argument("--zoom", type=float, help="zoom every clip this much instead of a random amount")
     ap.add_argument("--speed-prob", type=float, default=0.4, help="chance a clip is retimed")
     ap.add_argument("--speed-min", type=float, default=0.33, help="slowest playback rate")
     ap.add_argument("--speed-max", type=float, default=3.0, help="fastest playback rate")
@@ -440,20 +450,33 @@ def main():
     ap.add_argument("--rotate-max", type=float, default=180.0,
                     help="rotated clips get a random angle in ±this many degrees")
     ap.add_argument("--fade-prob", type=float, default=0.35, help="chance a clip crossfades in")
-    ap.add_argument("--fade-min", type=float, default=0.4,
-                    help="shortest crossfade, seconds; clips too short for one get a hard cut")
-    ap.add_argument("--fade-max", type=float, default=2.5, help="longest crossfade, seconds")
+    ap.add_argument("--fade-min", type=float, help=f"shortest crossfade, seconds (default {RANGES['fade'][0]:g}); "
+                    "clips too short for one get a hard cut")
+    ap.add_argument("--fade-max", type=float, help=f"longest crossfade, seconds (default {RANGES['fade'][1]:g})")
+    ap.add_argument("--fade", type=float,
+                    help="make every crossfade this long instead of a random length (--fade-prob sets how often)")
     ap.add_argument("-j", "--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--keep-temp", action="store_true", help="keep rendered clips")
     args = ap.parse_args()
+    # --clip, --zoom and --fade pin a range to one value; otherwise unset bounds take their defaults.
+    for name, (low, high) in RANGES.items():
+        fixed, lo, hi = getattr(args, name), getattr(args, f"{name}_min"), getattr(args, f"{name}_max")
+        if fixed is not None:
+            if lo is not None or hi is not None:
+                ap.error(f"use --{name} or --{name}-min/--{name}-max, not both")
+            lo = hi = fixed
+        setattr(args, f"{name}_min", low if lo is None else lo)
+        setattr(args, f"{name}_max", high if hi is None else hi)
     if not all(math.isfinite(v) for v in vars(args).values() if isinstance(v, float)):
         ap.error("numbers must be finite (inf and nan are not allowed)")
-    if not (0 < args.clip_min <= args.clip_max and 1 <= args.zoom_min <= args.zoom_max):
-        ap.error("need 0 < clip-min <= clip-max and 1 <= zoom-min <= zoom-max")
+    if not 0 < args.clip_min <= args.clip_max:
+        ap.error(f"need 0 < clip-min <= clip-max (they are {args.clip_min:g} and {args.clip_max:g})")
+    if not 1 <= args.zoom_min <= args.zoom_max:
+        ap.error(f"need 1 <= zoom-min <= zoom-max (they are {args.zoom_min:g} and {args.zoom_max:g})")
     if not (0 < args.speed_min <= args.speed_max):
         ap.error("need 0 < speed-min <= speed-max")
     if not (0 <= args.fade_min <= args.fade_max):
-        ap.error("need 0 <= fade-min <= fade-max")
+        ap.error(f"need 0 <= fade-min <= fade-max (they are {args.fade_min:g} and {args.fade_max:g})")
     if not all(0 <= p <= 1 for p in (args.speed_prob, args.rotate_prob, args.fade_prob)):
         ap.error("--speed-prob, --rotate-prob and --fade-prob must be between 0 and 1")
     if not (args.duration > 0 and args.fps > 0 and args.jobs >= 1 and args.rotate_max >= 0):
