@@ -204,7 +204,9 @@ def plan_clips(sources, args, rng):
             speed = math.exp(rng.uniform(math.log(args.speed_min), math.log(args.speed_max)))
         # `span` is the stretch of source consumed; the clip plays it back in span / speed seconds.
         span = min(rng.uniform(args.clip_min, args.clip_max) * speed, meta["duration"] - 0.05)
-        frames = max(2, int(span / speed * fps))  # a lone frame has no duration and vanishes when joined
+        # A lone frame has no duration and vanishes when joined. The 1e-6 absorbs float noise, or
+        # (3 * speed) / speed * 30 can come out as 89.99999 and a fixed 3 s clip loses a frame.
+        frames = max(2, int(span / speed * fps + 1e-6))
         length = frames / fps
         span = length * speed
         start = rng.uniform(0, max(0.0, meta["duration"] - span))
