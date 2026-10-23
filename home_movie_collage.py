@@ -532,7 +532,9 @@ def main():
     ap.add_argument("--fade-max", type=float, help=f"longest crossfade, seconds (default {RANGES['fade'][1]:g})")
     ap.add_argument("--fade", type=float,
                     help="make every crossfade this long instead of a random length (--fade-prob sets how often)")
-    ap.add_argument("-j", "--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("-j", "--jobs", type=int, default=min(2, os.cpu_count() or 1),
+                    help="clips rendered at once (default 2); more is faster but can make the computer "
+                         "sluggish, especially with 4K footage")
     ap.add_argument("--keep-temp", action="store_true", help="keep rendered clips")
     ap.add_argument("--version", action="version", version=f"%(prog)s {package_version()}")
     args = ap.parse_args()

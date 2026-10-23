@@ -104,6 +104,7 @@ home-movie-collage ~/Movies/home-videos --seed 1234
 | `--speed-prob` | 0.4 | chance a clip is sped up or slowed down (0.33x to 3x) |
 | `--rotate-prob` | 0.4 | chance a clip is rotated (up to 180 degrees either way) |
 | `--seed N` | random | reproduce an earlier collage |
+| `-j N` | 2 | clips rendered at once; more is faster but can make the computer sluggish |
 
 ## Good to know
 
@@ -114,8 +115,9 @@ home-movie-collage ~/Movies/home-videos --seed 1234
 - **It never overwrites your videos.** `-o` only replaces an earlier collage (one with a
   `.plan.json` beside it), and earlier collages in a source folder are not used as sources.
 - **It is silent:** the collage has no audio.
-- **Speed:** clips render in parallel (`-j` sets how many at once). HDR clips take 3 to 4 times
-  longer than normal ones. What it learns about each video is cached (in
+- **Speed:** two clips render at a time, which keeps the computer usable meanwhile; `-j 4` or
+  more is faster but can make it sluggish, especially with 4K footage. HDR clips take 3 to 4
+  times longer than normal ones. What it learns about each video is cached (in
   `~/Library/Caches/home-movie-collage` on macOS, `~/.cache/home-movie-collage` on Linux, or
   `%LOCALAPPDATA%\home-movie-collage` on Windows), so later runs start faster; it is safe to
   delete.
