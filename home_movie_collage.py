@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from importlib import metadata
 from pathlib import Path
@@ -370,15 +371,24 @@ def render_clip(index, clip, args, workdir):
     # of hard cuts gains or loses about a frame per hundred clips when assemble() joins them.
     out = workdir / f"clip{index:05d}.nut"
     start = clip["start"]
+    # Jobs share the cores: left alone, each ffmpeg decoding 4K HEVC runs ~70 threads, and five of
+    # them starve the whole computer. On macOS the hardware decoder halves the work (same frames).
+    threads = str(max(1, (os.cpu_count() or 2) // args.jobs))
+    hwaccel = ["-hwaccel", "videotoolbox"] if sys.platform == "darwin" else []
     for seek in sorted({start, max(0.0, start - 10), 0.0}, reverse=True):
-        cmd = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-ss", f"{seek:.3f}", "-i", clip["source"],
-               "-vf", clip_filter(clip, args, trim=start - seek), "-an", "-frames:v", str(clip["frames"]),
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", str(out)]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            raise RuntimeError((res.stderr.strip().splitlines() or ["ffmpeg failed"])[-1])
-        if count_frames(out) == clip["frames"]:
-            return out
+        # Damaged video can stop the hardware decoder (or garble its frames) where software decoding
+        # conceals the damage, so a hardware attempt that reports a failure is redone in software.
+        for hw in ([hwaccel, []] if hwaccel else [[]]):
+            cmd = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-filter_threads", threads, *hw,
+                   "-threads", threads, "-ss", f"{seek:.3f}", "-i", clip["source"],
+                   "-vf", clip_filter(clip, args, trim=start - seek), "-an", "-frames:v", str(clip["frames"]),
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-threads", threads, str(out)]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0 and not hw:
+                raise RuntimeError((res.stderr.strip().splitlines() or ["ffmpeg failed"])[-1])
+            if (res.returncode == 0 and "hardware accelerator failed" not in res.stderr
+                    and count_frames(out) == clip["frames"]):
+                return out
     raise RuntimeError(f"no frames decoded at {start}s")
 
 
@@ -476,6 +486,15 @@ def check_ffmpeg(output_ext):
             sys.exit(f"this ffmpeg has no {name} encoder, which {use} needs: {FFMPEG_HINT}")
 
 
+def lower_priority():
+    """Render below everything else, so the computer stays usable; ffmpeg still gets idle cores."""
+    if hasattr(os, "nice"):
+        os.nice(10)
+    elif sys.platform == "win32":  # child processes inherit a below-normal priority class
+        import ctypes
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
+
+
 def package_version():
     try:
         return metadata.version("home-movie-collage")
@@ -565,11 +584,26 @@ def main():
         sys.exit("nothing to work with")
 
     clips = plan_clips(sources, args, rng)
+    lower_priority()
     args.workdir = Path(tempfile.mkdtemp(prefix="collage-"))
     try:
         print(f"rendering {len(clips)} clips with {args.jobs} jobs…", file=sys.stderr)
+        done, lock, tty = iter(range(1, len(clips) + 1)), threading.Lock(), sys.stderr.isatty()
+
+        def progress(_):  # one line redrawn in a terminal; in a log, a line every tenth of the way
+            with lock:
+                n = next(done)
+                if tty:
+                    print(f"\r{n}/{len(clips)} clips done", end="", file=sys.stderr, flush=True)
+                elif n == len(clips) or n % max(1, len(clips) // 10) == 0:
+                    print(f"{n}/{len(clips)} clips done", file=sys.stderr, flush=True)
+
         with ThreadPoolExecutor(args.jobs) as pool:
             futures = [pool.submit(render_clip, i, clip, args, args.workdir) for i, clip in enumerate(clips)]
+            for future in futures:
+                future.add_done_callback(progress)
+        if tty:
+            print(file=sys.stderr)  # end the progress line
         kept, clip_files = [], []
         for i, (clip, future) in enumerate(zip(clips, futures)):
             try:

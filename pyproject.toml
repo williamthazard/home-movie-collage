@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "home-movie-collage"
-version = "0.1.0"
+version = "0.1.1"
 description = "Turn a folder of home movies into a random, heavily zoomed, silent video collage (uses ffmpeg)"
 readme = "README.md"
 license = "MIT"
