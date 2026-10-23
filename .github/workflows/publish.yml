@@ -1,0 +1,52 @@
+# Publishes to PyPI when a GitHub release is published, using PyPI trusted publishing (no tokens).
+# Follows https://packaging.python.org/en/latest/guides/publishing-package-distribution-releases-using-github-actions-ci-cd-workflows/
+# Actions are pinned to exact commits (version in the comment): a moved tag cannot change what runs
+# with the right to publish. To update one, pin the commit of its newer release.
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: Build the package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.x"
+      - name: Check the release tag matches the version in pyproject.toml
+        run: |
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::release tag $GITHUB_REF_NAME does not match version $version in pyproject.toml (expected v$version)"
+            exit 1
+          fi
+      - name: Build the sdist and wheel
+        run: |
+          python3 -m pip install build --user
+          python3 -m build
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
+        with:
+          name: python-package-distributions
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/home-movie-collage
+    permissions:
+      id-token: write  # lets PyPI confirm the upload comes from this repository's workflow
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with:
+          name: python-package-distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3

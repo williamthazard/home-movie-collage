@@ -47,17 +47,17 @@ Then run `pipx ensurepath` (on Windows, `py -m pipx ensurepath`) and open a new 
 **3. home-movie-collage**
 
 ```
-pipx install https://github.com/williamthazard/home-movie-collage/archive/refs/heads/main.zip
+pipx install home-movie-collage
 ```
 
-To update to the latest version later:
+To update later: `pipx upgrade home-movie-collage`. To remove it: `pipx uninstall
+home-movie-collage`. `home-movie-collage --version` shows which version you have.
 
-```
-pipx install --force https://github.com/williamthazard/home-movie-collage/archive/refs/heads/main.zip
-```
-
-To remove it: `pipx uninstall home-movie-collage`. `home-movie-collage --version` shows which
-version you have.
+If you already work in Python virtual environments, `pip install home-movie-collage` inside one
+works too. A plain `pip install` outside one is refused on many systems (an
+"externally-managed-environment" error), which is why pipx is the recommended way. To try the
+newest unreleased changes instead:
+`pipx install --force https://github.com/williamthazard/home-movie-collage/archive/refs/heads/main.zip`.
 
 ## Use
 
@@ -127,4 +127,4 @@ home-movie-collage ~/Movies/home-videos --seed 1234
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+MIT; see [LICENSE](https://github.com/williamthazard/home-movie-collage/blob/main/LICENSE).

@@ -22,6 +22,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/williamthazard/home-movie-collage"
+Issues = "https://github.com/williamthazard/home-movie-collage/issues"
 
 [project.scripts]
 home-movie-collage = "home_movie_collage:main"
